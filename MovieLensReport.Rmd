@@ -1,0 +1,316 @@
+---
+title: "MovieLens Project for 125x.9"
+author: "Tasha Vincent"
+date: "January 26, 2019"
+output:
+  word_document: default
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+
+Introduction
+The purpose of this project is to replicate and improve upon the results of the MovieLens recommendation system introduced in edX Data Science 125x.8. The dataset used was as described in the setup instructions for the Capstone project. In addition to modeling the effects of movie-specific and user-specific ratings, I also explored the effect of genre on the ratings. This involved adding additional packages such as tidyr, and stringr, to manipulate the genres into a single variable that could be analyzed. 
+
+The quality of the model was evaluated based on RMSE rating, with a target result of RMSE <= 0.87750. Results were summarized separately as each term was added to the model.
+
+Methods and Analysis
+
+Per the instructions for this project, the MovieLens dataset was accessed and manipulated to retrieve a subset of the data:
+
+```{r setup, echo=FALSE}
+# Note: this process could take a couple of minutes
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- read.table(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                      col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+```
+
+I partitioned the data to create a subset of 10% of the data to validate the algorithm developed in the course of the project. To ensure that no movies with only 1 rating ended up in the test data, I made a list of single-rating movies to keep them out of validation set
+
+```{r setup 1a, echo=FALSE}
+reviews <- movielens %>%
+  group_by(movieId) %>%
+  summarize(count = n()) 
+
+singles <- reviews %>%
+  filter(count == 1) 
+
+```
+
+then split the data:
+```{r setup2, echo=FALSE}
+library(caret)
+set.seed(1)
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+```
+
+Because we were modeling the effects of user ID and movie ID, we wanted to ensure that both the training (edx) set and the validation set contained the same users and movies.
+
+```{r setup3, echo=FALSE}
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")  %>%
+  anti_join(singles, by = 'movieId')
+
+# Add rows removed from validation set back into edx set
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+```
+
+
+Next I explored the data’s contents and dimensions to generate hypothetical effects on predicted ratings. 
+```{r explore, echo=FALSE}
+library(tidyverse)
+head(edx)
+edx %>% 
+  summarize(n_users = n_distinct(userId),
+            n_movies = n_distinct(movieId))
+
+```
+
+I created a visualization of the count of ratings per movie to see if there was a pattern.
+```{r explore movies, echo=FALSE}
+edx %>% 
+  count(movieId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, color = "black") + 
+  scale_x_log10() + 
+  ggtitle("Movies")
+
+```
+
+The single-rating movies stand out at the left. I then looked at the number of ratings per user.
+```{r explore user, echo=FALSE}
+edx %>% 
+  count(userId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, color = "black") + 
+  scale_x_log10() + 
+  ggtitle("Users")
+
+
+```
+It's clear from the graph that many users only evaluate one to two movies, but the majority of people rate multiple movies. A few superstars rate thousands of them.
+
+Storing Results
+Since we are using residual means of the squared estimate (RMSE) to measure the quality of the algorithm, I created a function to evaluate whether the predictions generated are close to the actual ratings for a given movie and user.
+```{r  rmse}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+```
+
+Models
+Initially, I started with a basic model that predicts that any movie will get the average rating.
+```{r avg, echo=FALSE}
+mu <- mean(edx$rating)
+mu
+
+```
+
+I then applied the function that I created to determine how well this model performs.
+
+```{r basic, echo=FALSE}
+avg_only <- RMSE(validation$rating, mu)
+avg_only
+```
+
+To validate that this simple model it is better than guessing, I plugged in various values of ratings from 0 to 5 instead of the average rating.
+
+```{r basic2, echo=FALSE}
+  predictions <- rep(3.1, nrow(validation))
+  RMSE(validation$rating, predictions)
+```
+  
+ In each case,the result is a larger RMSE, so mu is better than guessing.
+
+So that I may store and easily compare and report results from various models, I created a data frame, and added the first results.
+```{r results, echo=FALSE}
+rmse_results <- data_frame(Model = "Simple average", RMSE = avg_only)
+
+```
+
+
+Movie Effect
+I hypothesized that the inherent quality of the movie should be a big factor in determining the ratings awarded by users.to confirm that there is a distribution of ratings by movie, I created a visualization showing the number of ratings within each band.
+```{r graph movies, echo=FALSE}
+movie_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(m_avg = mean(rating))
+movie_avgs %>% qplot(m_avg, geom ="histogram", bins = 10, data = ., color = I("black"))
+```
+
+The ratings appear to approximate a normal distribution, so a movie-specific weighting is appropriate. I then created a term for movie quality, m_q defined as the difference in average rating for a given movie from the average rating of all movies, mu.
+```{r m_q}
+mu <- mean(edx$rating) 
+mq_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(m_q = mean(rating - mu))
+```
+
+
+
+To confirm that this was on the right track, I created a visualization to verify that the distribution of the movie quality term matches the distribution of average movie ratings overall.
+```{r m_q graph, echo=FALSE}
+mq_avgs %>% qplot(m_q, geom ="histogram", bins = 10, data = ., color = I("black"))
+
+```
+
+I added the new term to the model to see how much the prediction improves using predictions = mu + m_q and evaluated the model.
+```{r m_q results, echo=FALSE}
+  predictions <- mu + validation %>% 
+  left_join(mq_avgs, by='movieId') %>%
+  .$m_q
+
+movie_rmse <- RMSE(predictions, validation$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model="Movie Effect Model",  
+                                     RMSE = movie_rmse ))
+rmse_results %>% knitr::kable()
+
+```
+
+Users
+Next I hypothesized that there is a ‘set point’ of ratings by user; in other words, some users may love movies, or just be favorably predisposed to award higher ratings, and others may never rate above a 3. I created a graph to see how much a given user varies from the average rating for all users.
+```{r users graph, echo=FALSE}
+edx %>% 
+  group_by(userId) %>% 
+  summarize(u_b = mean(rating)) %>% 
+#  filter(n()>=5) %>%
+  ggplot(aes(u_b)) + 
+  geom_histogram(bins = 30, color = "black")
+
+```
+
+Although there is clearly a wide range of average ratings per user, there does not seem to be any more distribution if user only rated 10, 5 or even 1 film. The filter does not change the distribution.
+
+I defined the user bias per movie (u_b) as the difference between the user's average rating and the overall average and the movie-specific average.
+```{r u_b, echo=FALSE}
+user_avgs <- edx %>% 
+  left_join(mq_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(u_b = mean(rating - mu - m_q))
+
+```
+
+
+Next I added the user term to the model to see how much the prediction improves once we predict using  
+predictions = mu + m_q + u_b
+```{r u_b results, echo=FALSE}
+predicted_ratings <- validation %>% 
+  left_join(mq_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + m_q + u_b) %>%
+  .$pred
+
+users_rmse <- RMSE(predicted_ratings, validation$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model="Movie + User Effects Model",  
+                                     RMSE = users_rmse ))
+rmse_results %>% knitr::kable()
+```
+
+
+
+
+Genre
+
+Next I hypothesized that movies of a given the genre would be rated differently, so I created a list of ratings per genre for each movie.
+
+```{r genre1, echo=FALSE}
+library(tidyr)
+edx_genre <- separate_rows(edx, genres, sep = "\\|") 
+
+#Confirm that data is as expected
+edx_genre %>%
+  group_by(genres) %>%
+  summarize(n())
+```
+
+
+
+Now that I had a clean list of ratings per genre,  I plotted mean ratings per genre to test the hypothesis that there is a genre effect.
+```{r genre graph, echo=FALSE}
+library(dplyr)
+edx_genre %>%  
+  group_by(genres) %>% 
+  summarize(genre_avg = mean(rating)) %>%
+  ggplot(aes(genre_avg, genres)) + 
+  geom_point() +
+  geom_text(aes(label=genres))
+
+```
+
+Clearly the genre has some predictive value, as the averages for Horror are low compared to War, IMAX, Documentary and Film-Noir. I defined the genre bias as the difference between the overall mean and the genre-specific mean.
+```{r g_b, echo=FALSE}
+genre_avgs <- edx_genre %>% 
+  left_join(mq_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(genres) %>% 
+    summarize(g_b = mean(rating - mu - m_q - u_b)) 
+
+
+```
+  
+To see how much the prediction improves using predictions = mu + m_q + u_b + g_b 
+on validation data.
+```{r genre results, echo=FALSE}
+#first, create single-genre ratings in validation set
+validation_genre <- separate_rows(validation, genres, sep="\\|") 
+
+#then evaluate the model
+pg_ratings <- validation_genre %>% 
+  left_join(mq_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  mutate(pred = mu + m_q + u_b + g_b) %>%
+  .$pred
+
+
+genre_rmse <- RMSE(pg_ratings, validation_genre$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model="Movie + User + Genre Effects Model",  
+                                     RMSE = genre_rmse ))
+rmse_results %>% knitr::kable()
+
+```
+
+
+That was a lot of work for a pretty tiny improvement!
+
+Results vs. Wrong Turns
+
+I took some wrong turns in the course of this project, which taught me a few lessons. 
+
+First, never underestimate the value of the escape character. Initially when I applied the separate_rows function, I had separated values based on the pipe character alone (separate_rows(edx, genres, sep="|")), which led to 25 genres including Sci, Fi, Film, Noir, No, genre, and listed. To address these problems, I loaded the string_r packaged and applied the remove function to remove hyphens and spaces from the genres column.  However, I was still getting errors in the results. It turns out that the replace function and the remove function only apply to the first instance of the search term in any given row, so films like Blade Runner that were both Film-Noir and Sci-Fi we're still throwing errors in the data.  I addressed this problem by running the function twice.
+
+Second, I ran into several challenges with R being unable to allocate sufficient memory to complete certain tasks. I found that if I created a new column, rather than trying to replace a value in an existing column, that the command would often complete rather than throwing a memory exception. I also learned that if I shut down every other application on my computer so that R was the only application running, the command would often incomplete. When neither of those approaches worked, I shut down the R session entirely and started a new session with the command being the first thing I ran in the new session.
+
+Third, I wasted a lot of time splitting the edx set into a train_set and test_set. I thought that this would be helpful since it would reduce the amount of data to process while training the model, but I had not taken sufficient care to ensure that the same movies and users existed in the training set, the test set, and the validation set. Ultimately, I ended up with a model that worked well on the test and train data subsets of edx, but failed to generate results on the validation data because of movies with a single rating appearing only in the validation set. I created a list of movie_ids with a single rating, and removed those from the validation set using anti_join. Once I removed the complication of the test and train data subsets of edx, it was easy to apply the model that I had developed to the full edx and validation sets.
+
+Conclusion and Next Steps
+Given that the target of RMSE <= 0.87750 was achieved with the movie and user effects model, the amount of effort required to further improve it by adding genre yielded minimal improvements. It's possible that this Improvement will not be realized in the larger data set, or may in fact get worse. To create a more robust model for genre  effect, I would next explore the nearest neighbors (knn) and other methods to generate predictions for genre. I would also explore whether time plays a role; for example if people are rating the 20th anniversary release of a film as opposed to its original.
+
